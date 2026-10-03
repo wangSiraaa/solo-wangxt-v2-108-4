@@ -271,24 +271,307 @@ def current_events(events: list[dict]) -> dict[str, dict]:
     return out
 
 
-def phase_metrics(events: list[dict]) -> dict:
+# ---------------------------------------------------------------------------
+# Interruption ledger: wall-clock time vs active roasting time
+# ---------------------------------------------------------------------------
+#
+# The roaster clock keeps running during a power cut or a safety inspection;
+# the heating does not.  The interruption ledger records those intervals so we
+# can report both durations honestly:
+#
+#   wall duration   = t1 - t0                (what a clock on the wall shows)
+#   active duration = wall minus the union of closed interruption intervals
+#                     that fall inside [t0, t1]
+#
+# A probe dropout (NULL sample) is *never* treated as an interruption — the
+# ledger only contains explicit operator entries.  Nothing here guesses: every
+# malformed condition (resume without a start, duplicate start/resume,
+# overlapping intervals, negative duration ...) is returned as an explicit
+# conflict and the affected active numbers stay null instead of being invented.
+
+INTERRUPTION_TIME_BASIS = {
+    "wall": "wall clock: t_end - t_start, never pauses",
+    "active": (
+        "active roasting: wall duration minus the union of CURRENT-VERSION, "
+        "closed, non-overlapping interruption intervals strictly inside the span"
+    ),
+    "interval_convention": (
+        "intervals are half-open [start_s, end_s); an anchor exactly at an "
+        "interval start is INSIDE the interruption, an anchor exactly at the "
+        "resume instant is active"
+    ),
+    "open_intervals": (
+        "an unclosed interval is capped at the last measured sample; active "
+        "duration is never extrapolated beyond the data"
+    ),
+    "probe_dropout_is_not_interruption": True,
+}
+
+
+def _current_rows(records: list[dict]) -> list[dict]:
+    return sorted(
+        (r for r in records if not r.get("superseded", False)),
+        # At the same instant a close (resume/terminate) is ordered before a new
+        # start: an interval that resumes exactly when another starts is legal
+        # half-open touching, not a duplicate start.
+        key=lambda r: (float(r["t_s"]), 1 if r["action"] == "start" else 0, r["id"]),
+    )
+
+
+def build_interruptions(
+    records: list[dict],
+    *,
+    data_end_s: float | None = None,
+) -> dict:
+    """Validate the current-version ledger and derive interruption intervals.
+
+    Pure function (same inputs -> same output), used by the API, the export and
+    the independent recompute endpoint.  Only non-superseded rows participate;
+    superseded rows belong to older versions and stay in storage/export.
+
+    The replay is deliberately simple: walk the rows in wall-clock order and
+    track which interval id is currently open.  Every illegal move becomes a
+    structured conflict rather than an exception, so callers can render it.
+    """
+    rows = _current_rows(records)
+    conflicts: list[dict] = []
+    intervals: list[dict] = []
+    open_row: dict | None = None
+    closed_ids: set = set()
+    batch_ended = False
+
+    for r in rows:
+        action = r["action"]
+        iid = r.get("interval_id")
+        if action == "start":
+            if iid is None:
+                conflicts.append({"kind": "start_without_interval_id", "record_id": r["id"]})
+                continue
+            if open_row is not None:
+                conflicts.append({
+                    "kind": "duplicate_start",
+                    "record_id": r["id"],
+                    "interval_id": iid,
+                    "open_interval_id": open_row["interval_id"],
+                    "message": "中断尚未恢复就又记录了一次中断开始",
+                })
+            elif iid in closed_ids:
+                conflicts.append({
+                    "kind": "duplicate_start",
+                    "record_id": r["id"],
+                    "interval_id": iid,
+                    "message": "该中断区间已关闭，不能重复开始",
+                })
+                continue
+            open_row = r
+        elif action in ("resume", "terminate"):
+            if action == "resume":
+                if open_row is None or open_row.get("interval_id") != iid:
+                    conflicts.append({
+                        "kind": "orphan_resume",
+                        "record_id": r["id"],
+                        "interval_id": iid,
+                        "t_s": float(r["t_s"]),
+                        "message": "没有处于打开状态的中断区间，恢复请求被拒绝（不猜测归属）",
+                    })
+                    continue
+                open_row = None
+                closed_ids.add(iid)
+            else:  # terminate
+                batch_ended = True
+                if iid is None:
+                    # Normal end while roasting — nothing to close.
+                    continue
+                if open_row is not None and open_row.get("interval_id") == iid:
+                    open_row = None
+                    closed_ids.add(iid)
+                elif iid not in closed_ids:
+                    conflicts.append({
+                        "kind": "orphan_terminate",
+                        "record_id": r["id"],
+                        "interval_id": iid,
+                        "t_s": float(r["t_s"]),
+                        "message": "终止记录指向一个不存在的中断区间",
+                    })
+
+    # Reassemble intervals from current rows (start + its closing row).
+    starts = {r["interval_id"]: r for r in rows if r["action"] == "start"}
+    closes = {}
+    for r in rows:
+        if r["action"] in ("resume", "terminate") and r.get("interval_id") is not None:
+            # The FIRST close is the legal one; replay has already flagged any
+            # later duplicate resume as an orphan.
+            closes.setdefault(r["interval_id"], r)
+    for iid, s in sorted(starts.items(), key=lambda kv: float(kv[1]["t_s"])):
+        c = closes.get(iid)
+        start_s = float(s["t_s"])
+        end_s = float(c["t_s"]) if c is not None else None
+        duration = None if end_s is None else round(end_s - start_s, 3)
+        if end_s is not None and end_s <= start_s:
+            conflicts.append({
+                "kind": "non_positive_duration",
+                "interval_id": iid,
+                "start_s": start_s,
+                "end_s": end_s,
+                "message": "中断结束时刻不晚于开始时刻",
+            })
+        intervals.append({
+            "interval_id": iid,
+            "version": int(s.get("version", 1)),
+            "start_s": start_s,
+            "end_s": end_s,
+            "close_action": None if c is None else c["action"],
+            "duration_s": duration,
+            "reason": s.get("reason", ""),
+            "note": s.get("note", ""),
+            "source": s.get("source", "manual"),
+            "start_source": s.get("source", "manual"),
+            "end_source": None if c is None else c.get("source", "manual"),
+            "start_record_id": s["id"],
+            "end_record_id": None if c is None else c["id"],
+            "is_open": c is None,
+        })
+
+    intervals.sort(key=lambda iv: iv["start_s"])
+
+    # Pairwise overlap, strict half-open semantics.  An open interval is capped
+    # at the last measured sample for this comparison and never extended past it.
+    cap = data_end_s
+    for i in range(len(intervals)):
+        for j in range(i + 1, len(intervals)):
+            a, b = intervals[i], intervals[j]
+            a_end = a["end_s"] if a["end_s"] is not None else cap
+            b_end = b["end_s"] if b["end_s"] is not None else cap
+            if a_end is None or b_end is None:
+                continue  # nothing to cap an open interval against
+            if a["start_s"] < b_end and b["start_s"] < a_end:
+                conflicts.append({
+                    "kind": "overlap",
+                    "interval_ids": [a["interval_id"], b["interval_id"]],
+                    "a": [a["start_s"], a["end_s"]],
+                    "b": [b["start_s"], b["end_s"]],
+                    "message": "两个中断区间相互重叠，无法确定活动时长（不猜测）",
+                })
+
+    if open_row is not None and batch_ended:
+        conflicts.append({
+            "kind": "ended_with_open_interval",
+            "interval_id": open_row["interval_id"],
+            "message": "批次已确认终止，但仍有未关闭的中断区间",
+        })
+
+    structural_kinds = {
+        "orphan_resume", "orphan_terminate", "duplicate_start",
+        "overlap", "non_positive_duration",
+        "start_without_interval_id", "ended_with_open_interval",
+    }
+    computable = not any(c["kind"] in structural_kinds for c in conflicts)
+
+    total_interrupted_s: float | None = None
+    if computable:
+        total = 0.0
+        uncapable_open = False
+        for iv in intervals:
+            if iv["duration_s"] is not None:
+                total += iv["duration_s"]
+            elif cap is not None and cap > iv["start_s"]:
+                total += cap - iv["start_s"]
+            else:
+                # open interval with no measured data to cap it: do not guess
+                uncapable_open = True
+        total_interrupted_s = None if uncapable_open else round(total, 3)
+
+    if batch_ended:
+        ledger_status = "ended"
+    elif open_row is not None:
+        ledger_status = "interrupted"
+    elif intervals:
+        ledger_status = "resumed"
+    else:
+        ledger_status = "in_progress"
+
+    return {
+        "computable": computable,
+        "ledger_status": ledger_status,
+        "intervals": intervals,
+        "conflicts": conflicts,
+        "total_interrupted_s": total_interrupted_s,
+        "open_interval_id": None if open_row is None else open_row["interval_id"],
+        "data_end_s": data_end_s,
+        "time_basis": INTERRUPTION_TIME_BASIS,
+    }
+
+
+def _subtract_intervals(
+    lo: float, hi: float, intervals: list[dict], data_end_s: float | None
+) -> float | None:
+    """Active seconds in wall span [lo, hi] after subtracting the union of
+    interruption intervals.  Returns None only when an open interval cannot be
+    capped by the measured data (never extrapolated)."""
+    if hi < lo:
+        return None
+    removed = 0.0
+    for iv in intervals:
+        s = iv["start_s"]
+        e = iv["end_s"]
+        if e is None:
+            if data_end_s is None:
+                return None
+            e = data_end_s
+        ov_lo = max(lo, s)
+        ov_hi = min(hi, e)
+        if ov_hi > ov_lo:
+            removed += ov_hi - ov_lo
+    return round(max(hi - lo - removed, 0.0), 3)
+
+
+def _anchor_in_interruption(
+    t: float, intervals: list[dict], data_end_s: float | None
+) -> dict | None:
+    """Half-open [start, end): an anchor at the resume instant is active; an
+    anchor at the interruption start (or anywhere inside) is not."""
+    for iv in intervals:
+        e = iv["end_s"] if iv["end_s"] is not None else data_end_s
+        if e is None:
+            continue
+        if iv["start_s"] <= t < e:
+            return iv
+    return None
+
+
+def phase_metrics(
+    events: list[dict],
+    interruptions: dict | None = None,
+    *,
+    data_end_s: float | None = None,
+) -> dict:
     """Development-time ratio etc., computed over explicit event intervals.
 
-    Intervals (all anchored on operator-visible, source-labelled events):
+    Two time bases are always reported side by side:
+
+    * the top-level ``*_s`` fields and ``development_ratio`` are **wall clock**
+      durations (unchanged historical behaviour);
+    * the matching ``*_active_s`` fields and ``development_ratio_active``
+      subtract ledger interruption intervals.  They are ``None`` whenever the
+      span boundary sits inside an interruption or the ledger is not
+      computable — never a guessed value.
+
+    Intervals (anchored on operator-visible, source-labelled events):
       drying:      charge -> turning point
       maillard:    turning point -> first crack start
       development: first crack start -> drop
       total:       charge -> drop
-    development_ratio = development / total.
-
-    Returns ``None`` fields (never a guessed value) when a boundary event is
-    missing, plus the exact events used so the computation is auditable.
+      development_ratio = development / total.
     """
     cur = current_events(events)
 
     def pt(kind: str):
         e = cur.get(kind)
-        return None if e is None else {"t_s": float(e["t_s"]), "source": e["source"]}
+        return None if e is None else {
+            "t_s": float(e["t_s"]),
+            "source": e["source"],
+            "event_id": e["id"],
+        }
 
     charge = pt("charge")
     tp = pt("turning_point")
@@ -311,18 +594,112 @@ def phase_metrics(events: list[dict]) -> dict:
     if development is not None and total not in (None, 0):
         ratio = round(development / total, 4)
 
+    # ---- active-roasting basis -----------------------------------------
+    active_status = "unavailable"
+    active_blockers: list[dict] = []
+    anchor_conflicts: list[dict] = []
+    drying_active = maillard_active = development_active = total_active = None
+    crack_window_active = None
+    ratio_active = None
+    interrupted_in_total = None
+
+    interval_list = interruptions["intervals"] if interruptions else []
+    ledger_conflict = bool(interruptions and not interruptions["computable"])
+
+    def active_span(a, b, metric: str):
+        nonlocal active_status
+        if a is None or b is None:
+            return None
+        for anchor in (a, b):
+            iv = _anchor_in_interruption(anchor["t_s"], interval_list, data_end_s)
+            if iv is not None:
+                active_blockers.append({
+                    "metric": metric,
+                    "reason": "anchor_inside_interruption",
+                    "anchor_t_s": anchor["t_s"],
+                    "interval_id": iv["interval_id"],
+                    "message": "区间锚点落在中断期内，活动时长不可计算（不猜测）",
+                })
+                anchor_conflicts.append({
+                    "interval_id": iv["interval_id"],
+                    "metric": metric,
+                    "anchor_t_s": anchor["t_s"],
+                })
+                return None
+        return _subtract_intervals(a["t_s"], b["t_s"], interval_list, data_end_s)
+
+    if interruptions is not None:
+        if ledger_conflict:
+            active_status = "conflict"
+        else:
+            drying_active = active_span(charge, tp, "drying")
+            maillard_active = active_span(tp, fc, "maillard")
+            development_active = active_span(fc, drop, "development")
+            crack_window_active = active_span(fc, fce, "first_crack_window")
+            total_active = active_span(charge, drop, "total")
+            if total_active is not None and total is not None:
+                interrupted_in_total = round(total - total_active, 3)
+            if development_active is not None and total_active not in (None, 0):
+                ratio_active = round(development_active / total_active, 4)
+            if active_blockers:
+                active_status = "partial"
+            else:
+                active_status = "ok"
+
+    duration_table = []
+    for key, label, definition, wall_v, active_v in [
+        ("drying", "脱水期", "charge -> turning_point", drying, drying_active),
+        ("maillard", "梅纳/反应期", "turning_point -> first_crack_start", maillard, maillard_active),
+        ("development", "发展期", "first_crack_start -> drop", development, development_active),
+        ("first_crack_window", "一爆持续", "first_crack_start -> first_crack_end",
+         crack_window, crack_window_active),
+        ("total", "总时长", "charge -> drop", total, total_active),
+    ]:
+        duration_table.append({
+            "key": key,
+            "label": label,
+            "definition": definition,
+            "wall_s": wall_v,
+            "active_s": active_v,
+            "interrupted_s": None
+            if wall_v is None or active_v is None
+            else round(wall_v - active_v, 3),
+        })
+
     return {
+        # Wall clock (unchanged keys — every historical consumer keeps working)
         "drying_s": drying,
         "maillard_s": maillard,
         "development_s": development,
         "first_crack_window_s": crack_window,
         "total_s": total,
         "development_ratio": ratio,
+        # Active roasting basis
+        "drying_active_s": drying_active,
+        "maillard_active_s": maillard_active,
+        "development_active_s": development_active,
+        "first_crack_window_active_s": crack_window_active,
+        "total_active_s": total_active,
+        "development_ratio_active": ratio_active,
+        "interrupted_within_total_s": interrupted_in_total,
+        "active_metrics_status": active_status,
+        "active_blockers": active_blockers,
+        "anchor_conflicts": anchor_conflicts,
+        "duration_table": duration_table,
         "interval_definition": {
             "drying": "charge -> turning_point",
             "maillard": "turning_point -> first_crack_start",
             "development": "first_crack_start -> drop",
             "development_ratio": "development_s / total_s (charge -> drop)",
+            "development_ratio_active": (
+                "development_active_s / total_active_s; null when any anchor is "
+                "inside an interruption or the ledger conflicts"
+            ),
+        },
+        "time_basis": {
+            "wall_fields_suffix": "_s",
+            "active_fields_suffix": "_active_s",
+            **INTERRUPTION_TIME_BASIS,
         },
         "anchors": {
             "charge": charge,
@@ -331,6 +708,43 @@ def phase_metrics(events: list[dict]) -> dict:
             "first_crack_end": fce,
             "drop": drop,
         },
+    }
+
+
+def elapsed_summary(
+    events: list[dict],
+    interruptions: dict | None,
+    data_end_s: float,
+) -> dict:
+    """Page-level clock answer: elapsed WALL time and elapsed ACTIVE roasting
+    time up to the drop event (or the last measured sample while ongoing)."""
+    cur = current_events(events)
+    drop = cur.get("drop")
+    wall_end = float(drop["t_s"]) if drop else float(data_end_s)
+    charge = cur.get("charge")
+    wall_start = float(charge["t_s"]) if charge else 0.0
+    wall = round(wall_end - wall_start, 3)
+
+    active = None
+    status = "no_ledger"
+    if interruptions is not None:
+        if not interruptions["computable"]:
+            status = "conflict"
+        else:
+            # An open interval is capped at data_end_s, so an in-progress
+            # interruption is subtracted right up to "now" without extrapolating.
+            active = _subtract_intervals(
+                wall_start, wall_end, interruptions["intervals"], data_end_s
+            )
+            status = "interrupted_open" if interruptions["open_interval_id"] is not None else "ok"
+    return {
+        "wall_elapsed_s": wall,
+        "active_elapsed_s": active,
+        "excluded_interrupted_s": None if active is None else round(wall - active, 3),
+        "ended_with_drop": drop is not None,
+        "open_interval_id": interruptions["open_interval_id"] if interruptions else None,
+        "status": status,
+        "basis": "wall ends at drop event if present, otherwise at last measured sample",
     }
 
 

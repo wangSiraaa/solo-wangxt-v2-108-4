@@ -176,6 +176,57 @@
         symbol: 'none',
         data: markLines,
       };
+
+      // interruption ledger bands — drawn UNDER the curves (markArea z=1).
+      // A closed interval is [start, resume); an open interval is drawn to the
+      // last measured sample only, never extrapolated past the data.
+      const ledger = pl.interruptions;
+      if (ledger && ledger.intervals.length) {
+        const conflictIds = new Set(
+          ledger.conflicts
+            .filter((cf) => cf.interval_ids)
+            .flatMap((cf) => cf.interval_ids)
+        );
+        const anchorIds = new Set(
+          (pl.metrics?.anchor_conflicts || []).map((ac) => ac.interval_id)
+        );
+        const dataEnd = pts.length ? pts[pts.length - 1].t_s : 0;
+        const areas = ledger.intervals.map((iv) => {
+          const end = iv.end_s === null || iv.end_s === undefined ? dataEnd : iv.end_s;
+          const hard = conflictIds.has(iv.interval_id);
+          const anchorHit = anchorIds.has(iv.interval_id);
+          const color = hard
+            ? 'rgba(227,93,93,0.22)'
+            : anchorHit
+              ? 'rgba(227,150,74,0.20)'
+              : 'rgba(243,201,139,0.14)';
+          const border = hard ? '#e35d5d' : anchorHit ? '#e3964a' : '#d4af37';
+          return [
+            {
+              xAxis: iv.start_s,
+              itemStyle: {
+                color,
+                borderColor: border,
+                borderWidth: 1,
+                borderType: hard ? 'dashed' : 'solid',
+              },
+              label: {
+                show: true,
+                formatter: bandLabel(iv, hard),
+                color: border,
+                fontSize: 10,
+                position: 'insideTop',
+              },
+            },
+            { xAxis: end },
+          ];
+        });
+        target.markArea = {
+          silent: true,
+          z: 1,
+          data: areas,
+        };
+      }
     });
 
     return {
@@ -237,6 +288,12 @@
       drop: '出锅',
       custom: '标记',
     }[t] || t;
+  }
+
+  function bandLabel(iv, hard) {
+    const base = hard ? '⛔中断冲突' : iv.is_open ? '中断中…' : '加热中断';
+    const why = iv.reason ? ` ${iv.reason}` : '';
+    return `${base} #${iv.interval_id} v${iv.version}${why}`;
   }
 
   function render() {

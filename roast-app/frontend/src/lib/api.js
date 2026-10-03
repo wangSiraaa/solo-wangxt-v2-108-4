@@ -43,6 +43,52 @@ export async function listEvents(batchId, includeHistory = false) {
   return r.json();
 }
 
+// ---------------------------------------------------------------------------
+// interruption ledger (append-only, versioned)
+// ---------------------------------------------------------------------------
+
+export async function listInterruptions(batchId, includeHistory = false) {
+  const r = await fetch(
+    `/api/batches/${batchId}/interruptions?${qs({ include_history: includeHistory })}`
+  );
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function addInterruption(batchId, body) {
+  const r = await fetch(`/api/batches/${batchId}/interruptions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = (await tryJson(r)).detail;
+    throw new Error(detail || `请求失败 ${r.status}`);
+  }
+  return r.json();
+}
+
+export async function correctInterruption(batchId, intervalId, body) {
+  const r = await fetch(`/api/batches/${batchId}/interruptions/correct?interval_id=${intervalId}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const detail = (await tryJson(r)).detail;
+    throw new Error(detail || `请求失败 ${r.status}`);
+  }
+  return r.json();
+}
+
+async function tryJson(r) {
+  try {
+    return await r.json();
+  } catch {
+    return {};
+  }
+}
+
 export async function exportBatch(batchId, params = {}) {
   const r = await fetch(`/api/batches/${batchId}/export?${qs(params)}`);
   if (!r.ok) throw new Error(await r.text());
@@ -67,6 +113,27 @@ export const EVENT_LABELS = {
   drop: '出锅',
   damper_change: '风门变化',
   custom: '自定义',
+};
+
+export const INTERRUPT_ACTION_LABELS = {
+  start: '中断开始',
+  resume: '恢复加热',
+  terminate: '确认终止',
+};
+
+export const BATCH_STATUS_LABELS = {
+  in_progress: '进行中',
+  interrupted: '已中断（未恢复）',
+  resumed: '已恢复',
+  ended: '已结束',
+};
+
+export const INTERRUPT_REASONS = {
+  power_outage: '供电中断',
+  safety_inspection: '安全检查',
+  gas_supply: '燃气/热源问题',
+  operator_break: '操作员暂停',
+  other: '其他',
 };
 
 export function fmtTime(s) {

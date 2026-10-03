@@ -10,6 +10,11 @@
     listEvents,
     exportBatch,
     recompute,
+    listInterruptions,
+    addInterruption,
+    correctInterruption,
+    INTERRUPTION_REASONS,
+    BATCH_STATUS_LABELS,
     EVENT_LABELS,
     fmtTime,
   } from './lib/api.js';
@@ -22,6 +27,7 @@
   let dataB = null;
   let comparePayload = null;
   let eventHistory = [];
+  let interruptionData = null; // current ledger + records
   let loading = '';
   let error = '';
 
@@ -36,15 +42,27 @@
   let newEventDamper = '';
   let showHistory = false;
 
+  // interruption ledger form
+  let intAction = 'start'; // start | resume | terminate
+  let intTime = '5:00';
+  let intReason = 'power_cut';
+  let intNote = '';
+  // backdated correction form (keyed by interval_id)
+  let correctingId = null;
+  let corrStart = '';
+  let corrEnd = '';
+  let corrEndAction = 'resume';
+  let corrReason = 'safety_check';
+
   // export verification
   let verifyResult = null;
 
   const phaseKeys = [
-    ['drying_s', '脱水期', '下豆 → 回温点'],
-    ['maillard_s', '梅纳/反应期', '回温点 → 一爆开始'],
-    ['development_s', '发展期', '一爆开始 → 出锅'],
-    ['first_crack_window_s', '一爆持续', '一爆开始 → 一爆结束'],
-    ['total_s', '总时长', '下豆 → 出锅'],
+    ['drying_s', 'drying_active_s', '脱水期', '下豆 → 回温点'],
+    ['maillard_s', 'maillard_active_s', '梅纳/反应期', '回温点 → 一爆开始'],
+    ['development_s', 'development_active_s', '发展期', '一爆开始 → 出锅'],
+    ['first_crack_window_s', 'first_crack_window_active_s', '一爆持续', '一爆开始 → 一爆结束'],
+    ['total_s', 'total_active_s', '总时长', '下豆 → 出锅'],
   ];
 
   onMount(loadBatches);
@@ -89,6 +107,7 @@
     try {
       dataA = await getSeries(selA, { ...params, include_history: showHistory });
       eventHistory = await listEvents(selA, showHistory);
+      interruptionData = await listInterruptions(selA, showHistory);
       if (view === 'compare' && selB && selB !== selA) {
         comparePayload = await getCompare(selA, selB, params);
         dataB = comparePayload.batches[1];
@@ -143,6 +162,74 @@
     }
   }
 
+  async function submitInterruption() {
+    const t = parseMMSS(intTime);
+    if (t === null) {
+      error = '时间格式应为 m:ss，例如 5:00';
+      return;
+    }
+    loading = '登记中断动作…';
+    error = '';
+    try {
+      await addInterruption(selA, {
+        action: intAction,
+        t_s: t,
+        reason: intReason,
+        source: 'manual',
+        created_by: '操作员(界面)',
+        note: intNote,
+      });
+      intNote = '';
+      await refresh();
+    } catch (e) {
+      error = e.message;
+    } finally {
+      loading = '';
+    }
+  }
+
+  function startCorrect(iv) {
+    correctingId = iv.interval_id;
+    corrStart = fmtTime(iv.start_s);
+    corrEnd = iv.end_s === null || iv.end_s === undefined ? '' : fmtTime(iv.end_s);
+    corrEndAction = iv.end_action || 'resume';
+  }
+
+  function cancelCorrect() {
+    correctingId = null;
+  }
+
+  function findInterval(id) {
+    return (interruptionData?.current?.intervals || []).find((iv) => iv.interval_id === id);
+  }
+
+  async function submitCorrect() {
+    const s = parseMMSS(corrStart);
+    const e = corrEnd.trim() === '' ? null : parseMMSS(corrEnd);
+    if (s === null || (corrEnd.trim() !== '' && e === null)) {
+      error = '修正时间格式应为 m:ss';
+      return;
+    }
+    loading = '写入新版本修正…';
+    error = '';
+    try {
+      await correctInterruption(selA, correctingId, {
+        start_s: s,
+        end_s: e,
+        end_action: corrEndAction,
+        reason: corrReason,
+        created_by: '负责人(界面)',
+        note: '后补修正：旧版本保留可审计',
+      });
+      correctingId = null;
+      await refresh();
+    } catch (er) {
+      error = er.message;
+    } finally {
+      loading = '';
+    }
+  }
+
   async function verifyExport() {
     loading = '导出并重算校验…';
     error = '';
@@ -159,10 +246,15 @@
           env_temp_c: p.env_temp_c,
         })),
         events: ex.events,
+        interruptions: ex.interruption_ledger_full || ex.interruptions?.records || [],
         params: ex.params,
       });
       const keys = Object.keys(ex.metrics).filter(
-        (k) => k.endsWith('_s') || k === 'development_ratio'
+        (k) =>
+          k.endsWith('_s') ||
+          k === 'development_ratio' ||
+          k === 'development_ratio_active' ||
+          k === 'active_time_computable'
       );
       const rows = keys.map((k) => ({
         key: k,
@@ -170,6 +262,16 @@
         recomputed: rc.metrics[k],
         match: ex.metrics[k] === rc.metrics[k],
       }));
+      const bandsSame =
+        JSON.stringify(ex.series.interruption_bands) ===
+        JSON.stringify(rc.series.interruption_bands);
+      const conflictsSame =
+        JSON.stringify(
+          (ex.metrics.interruption_basis?.conflicts || []).map((c) => c.code).sort()
+        ) ===
+        JSON.stringify(
+          (rc.metrics.interruption_basis?.conflicts || []).map((c) => c.code).sort()
+        );
       // Changing window/smoothing must leave every stored sample untouched.
       const alt = await getSeries(selA, {
         window_s: windowS * 2,
@@ -179,7 +281,7 @@
       const sig = (arr) =>
         JSON.stringify(arr.map((p) => [p.t_s, p.bean_temp_c, p.env_temp_c]));
       const rawSame = sig(ex.series.raw_points) === sig(alt.series.raw_points);
-      verifyResult = { rows, rawSame, exportObj: ex };
+      verifyResult = { rows, rawSame, bandsSame, conflictsSame, exportObj: ex };
     } catch (e) {
       error = e.message;
     } finally {
@@ -314,13 +416,35 @@
   {#if dataA}
     <section class="panel">
       <RoastChart {chartPayloads} {windowS} {smoothS} />
-      <div class="row" style="margin-top:6px;font-size:12px">
+      <div class="row" style="margin-top:6px;font-size:12px;flex-wrap:wrap">
         <span class="tag">圆点＝实测豆温</span>
         <span class="tag">虚线菱形＝线性插值（非实测）</span>
         <span class="tag">细点线＝环境温度</span>
         <span class="tag">金色竖虚线＝风门变化</span>
         <span class="tag">曲线断档＝缺测未桥接</span>
+        <span class="tag" style="border-color:#4a7fd4;color:#9dbce8">蓝色斜纹带＝停止加热（操作员账本）</span>
+        <span class="tag" style="border-color:#d49a37;color:#e3bd72">琥珀色点边带＝中断进行中（活动时长暂缺）</span>
+        <span class="tag" style="border-color:#e35d5d;color:#e98c8c">红色带＝中断冲突，活动时长不可计算</span>
       </div>
+      <div class="muted" style="margin-top:4px;font-size:11px">
+        探针失联（采样缺测）<b>不是</b>中断：缺测仍按插值/断档处理，绝不因 NULL 样本推断停机。
+        中断带只来自下方操作员登记的中断账本。
+      </div>
+      {#if dataA.metrics?.interruption_basis?.conflicts?.length}
+        <div class="warn" style="margin-top:8px">
+          <b>⚠ 中断账本冲突（活动口径不可计算，墙钟口径仍显示）：</b>
+          <ul style="margin:4px 0 0 18px">
+            {#each dataA.metrics.interruption_basis.conflicts as c}
+              <li>{c.message || c.code}</li>
+            {/each}
+          </ul>
+        </div>
+      {:else if dataA.metrics?.open_interruption}
+        <div class="warn" style="margin-top:8px;border-color:#d49a37">
+          ⌛ 存在未关闭中断（开始于 {fmtTime(dataA.metrics.open_interruption.start_s)}）：
+          墙钟时长照常累计；活动烘焙时长在恢复前显示 “—”，不猜测恢复时间。
+        </div>
+      {/if}
       {#if comparePayload}
         <div class="warn" style="margin-top:8px">{comparePayload.interpretation}</div>
       {/if}
@@ -328,30 +452,49 @@
 
     <section class="row">
       <div class="panel col">
-        <h2>阶段指标（明确区间）</h2>
+        <h2>阶段指标 · 墙钟时长 vs 活动烘焙时长</h2>
+        <div class="muted" style="font-size:12px;margin-bottom:6px">
+          <b>墙钟</b>＝沿时间轴 t₁−t₀（含中断）；<b>活动</b>＝墙钟扣除<b>已关闭</b>中断区间后的实际加热时长。
+          中断未关闭、区间重叠或锚点落在中断内时活动值为 “—”，绝不编造。
+          批次状态：<b>{BATCH_STATUS_LABELS[dataA.batch.status] || dataA.batch.status}</b>
+          {#if dataA.metrics?.total_interrupted_s !== null && dataA.metrics?.total_interrupted_s !== undefined}
+            · 已记录停热合计 {fmtTime(dataA.metrics.total_interrupted_s)}
+          {/if}
+        </div>
         <div class="row" style="gap:8px">
           {#each view === 'compare' && dataB ? [dataA, dataB] : [dataA] as pl, i}
-            <div style="flex:1;min-width:260px">
+            <div style="flex:1;min-width:300px">
               <div class="muted" style="margin-bottom:4px">
                 {i === 0 ? 'A' : 'B'} · {pl.batch.name}
+                · {BATCH_STATUS_LABELS[pl.batch.status] || pl.batch.status}
               </div>
               <table>
-                <tr><th>阶段</th><th>区间定义</th><th>时长</th><th>来源</th></tr>
-                {#each phaseKeys as [key, label, def]}
+                <tr>
+                  <th>阶段</th><th>区间定义</th>
+                  <th>墙钟</th><th>活动烘焙</th><th>来源</th>
+                </tr>
+                {#each phaseKeys as [wallKey, activeKey, label, def]}
                   <tr>
                     <td>{label}</td>
                     <td class="muted" style="font-size:11px">{def}</td>
-                    <td>{fmtTime(pl.metrics[key])}</td>
+                    <td>{fmtTime(pl.metrics[wallKey])}</td>
+                    <td>
+                      {#if pl.metrics[activeKey] === null || pl.metrics[activeKey] === undefined}
+                        <span class="muted">— 不可计算</span>
+                      {:else}
+                        {fmtTime(pl.metrics[activeKey])}
+                      {/if}
+                    </td>
                     <td style="font-size:11px">
-                      {#if key === 'drying_s'}
+                      {#if wallKey === 'drying_s'}
                         <span class="tag {pl.metrics.anchors.turning_point?.source}">
                           {pl.metrics.anchors.turning_point?.source || '—'}
                         </span>
-                      {:else if key === 'maillard_s'}
+                      {:else if wallKey === 'maillard_s'}
                         <span class="tag {pl.metrics.anchors.first_crack_start?.source}">
                           {pl.metrics.anchors.first_crack_start?.source || '—'}
                         </span>
-                      {:else if key === 'development_s' || key === 'first_crack_window_s'}
+                      {:else if wallKey === 'development_s' || wallKey === 'first_crack_window_s'}
                         <span class="tag {pl.metrics.anchors.first_crack_start?.source}">
                           FC {pl.metrics.anchors.first_crack_start?.source || '—'}
                         </span>
@@ -360,18 +503,40 @@
                   </tr>
                 {/each}
                 <tr>
-                  <td><b>发展时间比 DTR</b></td>
+                  <td><b>DTR（墙钟）</b></td>
                   <td class="muted" style="font-size:11px">发展期 / 总时长</td>
                   <td>
                     <b>
-                      {pl.metrics.development_ratio !== null
+                      {pl.metrics.development_ratio !== null && pl.metrics.development_ratio !== undefined
                         ? (pl.metrics.development_ratio * 100).toFixed(1) + '%'
                         : '—'}
+                    </b>
+                  </td>
+                  <td colspan="2"></td>
+                </tr>
+                <tr>
+                  <td><b>DTR（活动口径）</b></td>
+                  <td class="muted" style="font-size:11px">发展期(活动) / 总时长(活动)</td>
+                  <td></td>
+                  <td>
+                    <b>
+                      {#if pl.metrics.development_ratio_active === null || pl.metrics.development_ratio_active === undefined}
+                        <span class="muted">— 不输出伪造 DTR</span>
+                      {:else}
+                        {(pl.metrics.development_ratio_active * 100).toFixed(1) + '%'}
+                      {/if}
                     </b>
                   </td>
                   <td></td>
                 </tr>
               </table>
+              {#if pl.metrics?.interruption_basis?.anchor_notes?.length}
+                <div class="muted" style="font-size:11px;margin-top:4px">
+                  {#each pl.metrics.interruption_basis.anchor_notes as n}
+                    <div>ℹ {n.message}</div>
+                  {/each}
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -429,6 +594,148 @@
     </section>
 
     <section class="panel">
+      <h2>中断区间账本（批次 A）· 可审计 · 区分墙钟与活动时长</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:8px">
+        每条记录包含 <b>动作 / 时间 / 来源 / 原因 / 版本 / 状态</b>。合法迁移：
+        <b>进行中 → 已中断 → 已恢复 → 已结束</b>（任何阶段可确认终止）。
+        无未关闭中断的“恢复”和重复恢复会被拒绝；后补修正以<b>新版本</b>取代，旧版本保留。
+        当前批次状态：<b>{BATCH_STATUS_LABELS[dataA.batch.status] || dataA.batch.status}</b>
+      </div>
+
+      <div class="row" style="gap:8px;align-items:flex-end;flex-wrap:wrap">
+        <div>
+          <div class="muted">动作</div>
+          <select bind:value={intAction}>
+            <option value="start">中断开始（停止加热）</option>
+            <option value="resume">恢复加热</option>
+            <option value="terminate">确认终止批次</option>
+          </select>
+        </div>
+        <div>
+          <div class="muted">时间 m:ss（自下豆）</div>
+          <input bind:value={intTime} placeholder="5:00" style="width:90px" />
+        </div>
+        <div>
+          <div class="muted">原因</div>
+          <select bind:value={intReason}>
+            {#each Object.entries(INTERRUPTION_REASONS) as [k, v]}
+              <option value={k}>{v}</option>
+            {/each}
+          </select>
+        </div>
+        <div>
+          <div class="muted">备注</div>
+          <input bind:value={intNote} placeholder="可选" style="width:160px" />
+        </div>
+        <button on:click={submitInterruption}>
+          {intAction === 'start' ? '登记中断开始' : intAction === 'resume' ? '登记恢复' : '确认终止'}
+        </button>
+        <label class="inline" style="align-self:center">
+          <input type="checkbox" bind:checked={showHistory} on:change={refresh} />
+          显示历史/旧版本
+        </label>
+      </div>
+
+      {#if interruptionData?.current?.conflicts?.length}
+        <div class="warn" style="margin-top:8px">
+          <b>⚠ 当前中断区间存在冲突，活动时长/DTR 不可计算：</b>
+          <ul style="margin:4px 0 0 18px">
+            {#each interruptionData.current.conflicts as c}
+              <li>{c.message || c.code}</li>
+            {/each}
+          </ul>
+          可对相关区间做后补修正以消除冲突；修正不会删除任何旧记录。
+        </div>
+      {/if}
+
+      <table style="margin-top:10px">
+        <tr>
+          <th>动作</th><th>时间</th><th>原因</th><th>来源/登记人</th>
+          <th>版本</th><th>状态</th><th>记录时间</th><th></th>
+        </tr>
+        {#each (interruptionData?.records || []) as r}
+          <tr style={r.superseded ? 'opacity:.45' : ''}>
+            <td>
+              {#if r.action === 'start'}⏸ 中断开始
+              {:else if r.action === 'resume'}▶ 恢复
+              {:else}⏹ 终止{/if}
+            </td>
+            <td>{fmtTime(r.t_s)}</td>
+            <td>{INTERRUPTION_REASONS[r.reason] || r.reason || '—'}</td>
+            <td style="font-size:11px">
+              <span class="tag {r.source}">{r.source === 'manual' ? '人工' : r.source}</span>
+              {r.created_by}
+            </td>
+            <td>v{r.version}</td>
+            <td>{r.superseded ? '已被新版本取代（保留）' : '当前'}</td>
+            <td class="muted" style="font-size:11px">{r.created_at?.replace('T', ' ').slice(0, 19)}</td>
+            <td>
+              {#if r.action === 'start' && !r.superseded}
+                <button class="ghost" style="padding:2px 8px" on:click={() => startCorrect(findInterval(r.interval_id))}>
+                  后补修正
+                </button>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </table>
+
+      {#if correctingId}
+        <div class="panel" style="margin-top:10px;background:#2a241f;border:1px dashed #d49a37">
+          <b>后补修正 · 写入新版本（旧区间保留可审计）</b>
+          <div class="row" style="gap:8px;align-items:flex-end;margin-top:8px;flex-wrap:wrap">
+            <div>
+              <div class="muted">新开始 m:ss</div>
+              <input bind:value={corrStart} style="width:90px" />
+            </div>
+            <div>
+              <div class="muted">新结束 m:ss（留空＝仍中断）</div>
+              <input bind:value={corrEnd} placeholder="留空" style="width:90px" />
+            </div>
+            <div>
+              <div class="muted">结束动作</div>
+              <select bind:value={corrEndAction}>
+                <option value="resume">恢复</option>
+                <option value="terminate">终止</option>
+              </select>
+            </div>
+            <div>
+              <div class="muted">原因</div>
+              <select bind:value={corrReason}>
+                {#each Object.entries(INTERRUPTION_REASONS) as [k, v]}
+                  <option value={k}>{v}</option>
+                {/each}
+              </select>
+            </div>
+            <button on:click={submitCorrect}>提交新版本</button>
+            <button class="ghost" on:click={cancelCorrect}>取消</button>
+          </div>
+        </div>
+      {/if}
+
+      {#if interruptionData?.versions?.length}
+        <details style="margin-top:10px">
+          <summary class="muted" style="cursor:pointer">版本历史（{interruptionData.versions.length} 个版本）</summary>
+          <table style="margin-top:6px">
+            <tr><th>episode</th><th>版本</th><th>区间</th><th>状态</th><th>记录于</th></tr>
+            {#each interruptionData.versions as v}
+              <tr style={v.superseded ? 'opacity:.5' : ''}>
+                <td class="muted" style="font-size:10px">{v.interval_id?.slice(0, 8) || '批次终止'}</td>
+                <td>v{v.version}</td>
+                <td>
+                  {fmtTime(v.start_s)} → {v.open ? '开放中' : fmtTime(v.end_s)}
+                  {v.end_action ? `（${v.end_action === 'resume' ? '恢复' : '终止'}）` : ''}
+                </td>
+                <td>{v.superseded ? '已被新版本取代（保留）' : '当前生效'}</td>
+                <td class="muted" style="font-size:11px">{v.as_of?.replace('T', ' ').slice(0, 19)}</td>
+              </tr>
+            {/each}
+          </table>
+        </details>
+      {/if}
+    </section>
+
+    <section class="panel">
       <h2>缺测与插值审计 · 导出可复现</h2>
       <div class="row">
         <div style="flex:1;min-width:280px">
@@ -479,8 +786,20 @@
                 改变窗口/平滑后原始豆温/环温逐点比对：
                 {verifyResult.rawSame ? '✅ 完全不变' : '❌ 被修改'}
               </span>
-              <button class="ghost" style="margin-left:10px" on:click={downloadExport}>
-                下载导出 JSON
+            </div>
+            <div style="margin-top:4px">
+              <span class="{verifyResult.bandsSame ? '' : 'warn'}">
+                中断区间边界（导出 vs 独立重算）：{verifyResult.bandsSame ? '✅ 完全一致' : '❌ 不一致'}
+              </span>
+            </div>
+            <div style="margin-top:4px">
+              <span class="{verifyResult.conflictsSame ? '' : 'warn'}">
+                冲突判定与所用口径（导出 vs 独立重算）：{verifyResult.conflictsSame ? '✅ 完全一致' : '❌ 不一致'}
+              </span>
+            </div>
+            <div style="margin-top:8px">
+              <button class="ghost" on:click={downloadExport}>
+                下载导出 JSON（含全量中断账本与历史版本指标）
               </button>
             </div>
           {/if}

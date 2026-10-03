@@ -1,7 +1,9 @@
-"""FastAPI application: batch curves, sourced events, comparison, export."""
+"""FastAPI application: batch curves, sourced events, interruption ledger,
+comparison, export."""
 from __future__ import annotations
 
-import json
+import uuid
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -10,10 +12,32 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from . import synth
-from .analysis import RoRConfig, build_series, current_events, phase_metrics
+from .analysis import (
+    RoRConfig,
+    build_series,
+    current_events,
+    current_interruption_intervals,
+    interruption_versions,
+    phase_metrics,
+)
 from .config import CORS_ORIGINS, MAX_GAP_FILL_S
-from .models import Batch, Event, Sample, engine, init_db
-from .schemas import BatchMeta, EventIn, EventOut
+from .models import (
+    BATCH_STATES,
+    Batch,
+    Event,
+    InterruptionRecord,
+    Sample,
+    engine,
+    init_db,
+)
+from .schemas import (
+    BatchMeta,
+    EventIn,
+    EventOut,
+    InterruptionCorrectIn,
+    InterruptionIn,
+    InterruptionRecordOut,
+)
 
 app = FastAPI(title="Coffee Roast Batch Explorer", version="1.0.0")
 app.add_middleware(
@@ -75,6 +99,65 @@ def _events_as_dicts(batch: Batch, *, include_history: bool) -> list[dict]:
     return rows
 
 
+def _interruptions_as_dicts(
+    batch: Batch, *, include_history: bool
+) -> list[dict]:
+    rows = []
+    for r in batch.interruptions:
+        if not include_history and r.superseded:
+            continue
+        rows.append(_interruption_row_dict(r))
+    return rows
+
+
+def _interruption_row_dict(r: InterruptionRecord) -> dict:
+    return {
+        "id": r.id,
+        "batch_id": r.batch_id,
+        "interval_id": r.interval_id,
+        "version": r.version,
+        "action": r.action,
+        "t_s": r.t_s,
+        "reason": r.reason,
+        "source": r.source,
+        "created_by": r.created_by,
+        "note": r.note,
+        "superseded": r.superseded,
+        "superseded_by_id": r.superseded_by_id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    }
+
+
+def _all_interruption_dicts(batch: Batch) -> list[dict]:
+    """Full ledger including superseded rows — needed to reproduce any
+    historical version and for the self-contained export."""
+    return [_interruption_row_dict(r) for r in batch.interruptions]
+
+
+def _ledger_summary(batch: Batch, *, include_history: bool) -> dict:
+    """Current interpretation plus the versioned audit trail."""
+    full = _all_interruption_dicts(batch)
+    current = current_interruption_intervals(full)
+    summary = {
+        "status": batch.status,
+        "current": {
+            "intervals": current["intervals"],
+            "open": current["open"],
+            "computable": current["computable"],
+            "conflicts": current["conflicts"],
+        },
+        "records": _interruptions_as_dicts(batch, include_history=include_history),
+    }
+    if include_history:
+        summary["versions"] = interruption_versions(full)
+    return summary
+
+
+def _active_horizon_s(batch: Batch) -> float | None:
+    ts = [s.t_s for s in batch.samples]
+    return max(ts) if ts else None
+
+
 def _series_payload(
     batch: Batch,
     *,
@@ -83,22 +166,31 @@ def _series_payload(
     max_gap_fill_s: float,
     include_history: bool,
 ) -> dict[str, Any]:
+    sample_dicts = _samples_as_dicts(batch)
+    interruptions = _all_interruption_dicts(batch)
+    events = _events_as_dicts(batch, include_history=include_history)
     series = build_series(
-        _samples_as_dicts(batch),
+        sample_dicts,
         ror_cfg=RoRConfig(window_s=window_s, display_smooth_s=display_smooth_s),
         max_gap_fill_s=max_gap_fill_s,
+        interruption_records=interruptions,
     )
-    events = _events_as_dicts(batch, include_history=include_history)
     return {
         "batch": BatchMeta.model_validate(batch).model_dump(mode="json"),
         "series": series,
         "events": events,
-        "metrics": phase_metrics(events),
+        "interruptions": _ledger_summary(batch, include_history=include_history),
+        "metrics": phase_metrics(
+            events,
+            interruptions,
+            active_horizon_s=_active_horizon_s(batch),
+        ),
         "params": {
             "ror_window_s": window_s,
             "ror_display_smooth_s": display_smooth_s,
             "max_gap_fill_s": max_gap_fill_s,
             "raw_is_immutable": True,
+            "time_basis": "wall_clock_s and *_active_s (closed interruptions excluded)",
         },
     }
 
@@ -209,6 +301,254 @@ def list_events(batch_id: int, include_history: bool = Query(False)) -> list[Eve
 
 
 # ---------------------------------------------------------------------------
+# interruption ledger: auditable heat-off episodes
+#
+# The ledger is append-only like the event table, but it ALSO drives the
+# batch lifecycle state machine:
+#
+#   in_progress --start--> interrupted --resume--> resumed --start--> interrupted
+#        |                      |                     |
+#        +------terminate-------+-----terminate-------+--> ended
+#
+# A resume with no open interruption, a duplicate resume, and any action on an
+# ended batch are rejected — the active roasting time would otherwise be
+# double-counted or invented.  Overlapping current intervals are not rejected
+# at write time (they may be legitimately reported); they are recorded and the
+# active-time metrics refuse to compute until corrected in a NEW version.
+# ---------------------------------------------------------------------------
+
+def _open_interruption(
+    session: Session, batch_id: int
+) -> InterruptionRecord | None:
+    """The current (non-superseded) start row whose episode is not closed."""
+    starts = list(
+        session.scalars(
+            select(InterruptionRecord).where(
+                InterruptionRecord.batch_id == batch_id,
+                InterruptionRecord.action == "start",
+                InterruptionRecord.superseded.is_(False),
+            )
+        )
+    )
+    for st in starts:
+        closed = session.scalar(
+            select(InterruptionRecord.id).where(
+                InterruptionRecord.batch_id == batch_id,
+                InterruptionRecord.interval_id == st.interval_id,
+                InterruptionRecord.action.in_(("resume", "terminate")),
+                InterruptionRecord.superseded.is_(False),
+            )
+        )
+        if closed is None:
+            return st
+    return None
+
+
+def _reconcile_status(session: Session, batch: Batch) -> str:
+    """Recompute the status strictly from the current ledger rows and persist
+    it.  Keeps the stored column in lock-step with the ledger so the state
+    machine cannot drift."""
+    full = [
+        _interruption_row_dict(r)
+        for r in session.scalars(
+            select(InterruptionRecord)
+            .where(InterruptionRecord.batch_id == batch.id)
+            .order_by(InterruptionRecord.id)
+        )
+    ]
+    interp = current_interruption_intervals(full)
+    assert interp["batch_status"] in BATCH_STATES
+    batch.status = interp["batch_status"]
+    return batch.status
+
+
+@app.get("/api/batches/{batch_id}/interruptions")
+def list_interruptions(batch_id: int, include_history: bool = Query(False)) -> dict[str, Any]:
+    with Session(engine) as s:
+        _get_batch(s, batch_id)
+        b = s.get(Batch, batch_id)
+        return _ledger_summary(b, include_history=include_history)
+
+
+@app.post(
+    "/api/batches/{batch_id}/interruptions",
+    response_model=InterruptionRecordOut,
+)
+def add_interruption(batch_id: int, body: InterruptionIn) -> InterruptionRecord:
+    with Session(engine) as s:
+        b = _get_batch(s, batch_id)
+        if b.status == "ended":
+            raise HTTPException(409, "批次已结束（terminated），不能再登记中断动作。")
+
+        open_row = _open_interruption(s, batch_id)
+
+        if body.action == "start":
+            if open_row is not None:
+                raise HTTPException(
+                    409,
+                    f"已有未关闭的中断（开始于 {open_row.t_s}s）；"
+                    "重复开始不会另开区间，请先恢复或终止。",
+                )
+            row = InterruptionRecord(
+                batch_id=batch_id,
+                interval_id=str(uuid.uuid4()),
+                version=1,
+                action="start",
+                t_s=body.t_s,
+                reason=body.reason,
+                source=body.source,
+                created_by=body.created_by,
+                note=body.note,
+            )
+            s.add(row)
+            b.status = "interrupted"
+
+        elif body.action == "resume":
+            if open_row is None:
+                # No start to close: never fabricate one.
+                raise HTTPException(
+                    409,
+                    "没有未关闭的中断，恢复请求被拒绝（不能凭空增加活动时长口径）。",
+                )
+            if body.t_s < open_row.t_s:
+                raise HTTPException(
+                    422,
+                    f"恢复时刻 {body.t_s}s 早于中断开始 {open_row.t_s}s。",
+                )
+            # open_row exists => no current resume/terminate exists, so a
+            # duplicate resume can never reach here (a second POST finds no
+            # open row and is rejected above) — active time cannot be counted
+            # twice.
+            row = InterruptionRecord(
+                batch_id=batch_id,
+                interval_id=open_row.interval_id,
+                version=open_row.version,
+                action="resume",
+                t_s=body.t_s,
+                reason=body.reason,
+                source=body.source,
+                created_by=body.created_by,
+                note=body.note,
+            )
+            s.add(row)
+            b.status = "resumed"
+
+        else:  # terminate
+            if open_row is not None:
+                if body.t_s < open_row.t_s:
+                    raise HTTPException(
+                        422,
+                        f"终止时刻 {body.t_s}s 早于中断开始 {open_row.t_s}s。",
+                    )
+                row = InterruptionRecord(
+                    batch_id=batch_id,
+                    interval_id=open_row.interval_id,
+                    version=open_row.version,
+                    action="terminate",
+                    t_s=body.t_s,
+                    reason=body.reason,
+                    source=body.source,
+                    created_by=body.created_by,
+                    note=body.note,
+                )
+            else:
+                # Terminating with everything closed: a batch-level end marker
+                # without an interval (interval_id NULL).
+                row = InterruptionRecord(
+                    batch_id=batch_id,
+                    interval_id=None,
+                    version=1,
+                    action="terminate",
+                    t_s=body.t_s,
+                    reason=body.reason,
+                    source=body.source,
+                    created_by=body.created_by,
+                    note=body.note,
+                )
+            s.add(row)
+            b.status = "ended"
+            b.ended_at = datetime.utcnow()
+
+        s.commit()
+        s.refresh(row)
+        return row
+
+
+@app.post(
+    "/api/batches/{batch_id}/interruptions/correct",
+    response_model=list[InterruptionRecordOut],
+)
+def correct_interruption(
+    batch_id: int,
+    body: InterruptionCorrectIn,
+    interval_id: str = Query(..., description="要修正的逻辑中断 episode id"),
+) -> list[InterruptionRecord]:
+    """Backdated correction.  The old rows are kept (superseded) and a NEW
+    version is appended; current metrics are recomputed from the new version,
+    historical metrics remain auditable via ``versions``."""
+    with Session(engine) as s:
+        b = _get_batch(s, batch_id)
+        old_rows = list(
+            s.scalars(
+                select(InterruptionRecord).where(
+                    InterruptionRecord.batch_id == batch_id,
+                    InterruptionRecord.interval_id == interval_id,
+                ).order_by(InterruptionRecord.id)
+            )
+        )
+        if not old_rows:
+            raise HTTPException(404, f"interval {interval_id} not found")
+        current_rows = [r for r in old_rows if not r.superseded]
+        if not current_rows:
+            raise HTTPException(409, "该中断区间没有当前版本可修正。")
+        new_version = max(r.version for r in old_rows) + 1
+
+        # Mark every current row of this episode superseded by the new start.
+        new_start = InterruptionRecord(
+            batch_id=batch_id,
+            interval_id=interval_id,
+            version=new_version,
+            action="start",
+            t_s=body.start_s,
+            reason=body.reason,
+            source=body.source,
+            created_by=body.created_by,
+            note=body.note or f"后补修正（v{new_version}）：旧区间保留可审计",
+        )
+        s.add(new_start)
+        s.flush()
+        for r in current_rows:
+            r.superseded = True
+            r.superseded_by_id = new_start.id
+        created = [new_start]
+        if body.end_s is not None:
+            end_row = InterruptionRecord(
+                batch_id=batch_id,
+                interval_id=interval_id,
+                version=new_version,
+                action=body.end_action,
+                t_s=body.end_s,
+                reason=body.end_reason,
+                source=body.source,
+                created_by=body.created_by,
+                note=body.note or f"后补修正（v{new_version}）",
+            )
+            s.add(end_row)
+            created.append(end_row)
+
+        # Lifecycle follows the corrected ledger.
+        new_status = _reconcile_status(s, b)
+        if new_status == "ended" and b.ended_at is None:
+            b.ended_at = datetime.utcnow()
+        elif new_status != "ended":
+            b.ended_at = None
+        s.commit()
+        for r in created:
+            s.refresh(r)
+        return created
+
+
+# ---------------------------------------------------------------------------
 # comparison (no causal claims) + export / recompute
 # ---------------------------------------------------------------------------
 
@@ -252,9 +592,11 @@ def compare(
 
 @app.get("/api/batches/{batch_id}/export")
 def export_batch(batch_id: int, window_s: float = 30.0, display_smooth_s: float = 12.0) -> dict[str, Any]:
-    """Self-contained export: raw samples, sourced events, parameters, and the
-    derived phase metrics.  The metrics can be reproduced from raw + events +
-    the stated window (see /api/recompute)."""
+    """Self-contained export: raw samples, sourced events, the FULL
+    interruption ledger (all versions, including superseded rows), parameters,
+    and the derived phase metrics on both time bases.  Every metric can be
+    reproduced from raw + events + ledger + the stated window (see
+    /api/recompute)."""
     with Session(engine) as s:
         b = _get_batch(s, batch_id)
         payload = _series_payload(
@@ -264,12 +606,58 @@ def export_batch(batch_id: int, window_s: float = 30.0, display_smooth_s: float 
             max_gap_fill_s=MAX_GAP_FILL_S,
             include_history=True,
         )
-        payload["export_version"] = 1
+        full_ledger = _all_interruption_dicts(b)
+        horizon = _active_horizon_s(b)
+        # Historical metrics for every ledger version: what the operator would
+        # have seen under each prior version, kept for audit after corrections.
+        history = []
+        for v in interruption_versions(full_ledger):
+            # as_of just after the latest row written for that version, so the
+            # version's interval (open or closed) is reproduced as it existed
+            # immediately after that correction was recorded.
+            if not v["as_of"]:
+                continue
+            as_of_iso = v["as_of"]
+            history.append(
+                {
+                    "interval_id": v["interval_id"],
+                    "version": v["version"],
+                    "as_of": as_of_iso,
+                    "superseded": v["superseded"],
+                    "interval": {
+                        "start_s": v["start_s"],
+                        "end_s": v["end_s"],
+                        "open": v["open"],
+                    },
+                    "metrics_as_of_version": phase_metrics(
+                        _events_as_dicts(b, include_history=True),
+                        full_ledger,
+                        active_horizon_s=horizon,
+                        as_of=as_of_iso,
+                    ),
+                }
+            )
+        payload["export_version"] = 2
         payload["reproducibility"] = {
             "raw_samples_are_source_of_truth": True,
-            "metrics_depend_on": ["raw_samples", "current(non-superseded) events", "ror_window_s"],
+            "raw_and_gap_handling_never_modified_by_ledger": True,
+            "metrics_depend_on": [
+                "raw_samples",
+                "current(non-superseded) events",
+                "current(non-superseded) interruption ledger",
+                "ror_window_s",
+            ],
+            "time_bases": {
+                "wall_clock": "plain t1 - t0, ledger-independent",
+                "active_roasting": (
+                    "wall-clock minus union of CLOSED interruption intervals; "
+                    "null on conflict/open overlap/anchor-inside-band"
+                ),
+            },
             "pipeline": "numpy centred least-squares RoR; linear gap fill flagged",
         }
+        payload["interruption_ledger_full"] = full_ledger
+        payload["interruption_metric_history"] = history
         return payload
 
 
@@ -278,11 +666,13 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
     """Re-derive series + metrics from an export-style payload.
 
     Used to verify an export reproduces every stage metric without touching
-    the database.  Body: {"samples": [...], "events": [...], "params": {...}}.
+    the database.  Body: {"samples": [...], "events": [...],
+    "interruptions": [...all ledger rows...], "params": {...}}.
     """
     try:
         samples = payload["samples"]
         events = payload.get("events", [])
+        interruptions = payload.get("interruptions", [])
         params = payload.get("params", {})
     except KeyError as exc:
         raise HTTPException(422, f"missing field: {exc}")
@@ -294,11 +684,16 @@ def recompute(payload: dict[str, Any]) -> dict[str, Any]:
         samples,
         ror_cfg=cfg,
         max_gap_fill_s=float(params.get("max_gap_fill_s", MAX_GAP_FILL_S)),
+        interruption_records=interruptions,
     )
+    horizon = max((float(s["t_s"]) for s in samples), default=None)
     return {
         "series": series,
-        "metrics": phase_metrics(events),
+        "metrics": phase_metrics(
+            events, interruptions, active_horizon_s=horizon
+        ),
         "current_events": current_events(events),
+        "interruption_summary": current_interruption_intervals(interruptions),
     }
 
 

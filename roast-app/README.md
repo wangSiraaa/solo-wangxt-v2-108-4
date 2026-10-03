@@ -10,7 +10,7 @@
 | 前端 | Svelte 4 + Vite + ECharts 5 |
 | API | FastAPI（Pydantic 校验） |
 | 计算 | NumPy：温升率、插值、阶段指标，全部为纯函数 |
-| 存储 | PostgreSQL（原始采样、下豆点、人工标记），SQLAlchemy ORM |
+| 存储 | PostgreSQL（原始采样、下豆点、人工标记、中断账本），SQLAlchemy ORM |
 | 测试 | pytest，同一套用例在 SQLite 与 PostgreSQL 上运行 |
 
 ## 数据与口径（重要）
@@ -34,6 +34,31 @@
   `superseded_by_id`，不删除；自动建议记 `source=auto`，人工记 `source=manual`+`created_by`；
 - 风门变化允许多条并存（离散操作点），金色虚线标出。
 
+### 中断区间账本 —— 墙钟时长 ≠ 活动烘焙时长
+现场因**供电中断、安全检查**等停止加热时，操作员在中断账本登记动作。**探针失联（采样 NULL）
+不是中断**：缺测仍按“插值/断档”处理，系统绝不会因为一段时间没有探针读数就推断停机。
+- 每条账本记录含 `action`（start/resume/terminate）、`t_s`、`source`、`reason`、
+  `created_by`、`version`、`superseded` 状态，账本与事件一样**只追加、不删除、不改写**；
+- 批次状态机只允许合法迁移：
+  `进行中 in_progress → 已中断 interrupted → 已恢复 resumed → 已结束 ended`
+  （任意状态可 terminate；`resumed` 之后可再次 start 第二段中断）。
+  无未关闭中断的“恢复”、重复恢复、对已结束批次的任何动作一律 **409/422 拒绝**，
+  活动时长不可能被累计两次，也不会凭空补一个开始时刻；
+- 两套口径**始终并列**：
+  - **墙钟时长 wall-clock**：沿时间轴 `t₁−t₀`（包含中断），与账本无关、恒可计算；
+  - **活动烘焙时长 active roasting**：墙钟扣除该区间内**已关闭**中断的并集长度；
+    中断未关闭（恢复时刻未知）时相关活动值为 `null`，绝不猜测恢复时间；
+- **不猜测的冲突**：当前区间互相重叠、存在无开始的恢复/重复恢复/结束早于开始、
+  或阶段锚点严格落在中断区间**内部**时，冲突以显式 code 返回
+  （`overlapping_interruptions` / `invalid_ledger_structure` /
+  `phase_anchor_inside_interruption`），活动口径与活动 DTR 输出 `null`，
+  曲线带状标红；锚点恰好落在中断边界是允许的（仅出 note）；
+- **后补修正＝新版本**：对某一逻辑中断（interval_id）提交修正会写入 `version+1` 的
+  新 start/resume 行，旧行置 `superseded=true` 并链到新行。旧区间与“当时的指标”
+  在导出的 `interruption_metric_history` 中永久保留可审计；当前指标按新版本重算；
+- 中断区间在曲线图上以可见带状（markArea）呈现：蓝色＝已关闭停热、琥珀色点边＝中断中、
+  红色＝冲突；阶段指标表每个阶段同时给出墙钟与活动两列及活动口径 DTR。
+
 ### 发展时间比 —— 明确区间
 | 指标 | 区间 |
 |---|---|
@@ -44,7 +69,9 @@
 | 总时长 total | 下豆 → 出锅 |
 | **发展时间比 DTR** | development / total |
 
-边界事件缺失时指标为 `null`（不猜测），并返回每个锚点的来源以便审计。
+墙钟字段为 `drying_s / maillard_s / development_s / total_s / development_ratio`；
+活动口径对应 `drying_active_s / … / total_active_s / development_ratio_active`。
+边界事件缺失时指标为 `null`（不猜测），并返回每个锚点的来源与中断账本口径以便审计。
 
 ### 双批次对比 —— 不宣称因果
 两批次按开火/下豆时刻对齐叠加；风门变化前后的形态变化仅供观察，接口和界面都附带声明：
@@ -81,21 +108,33 @@
     DATABASE_URL=postgresql+psycopg2://roast:roast@localhost:5432/roast pytest
 
 界面“缺测与插值审计 · 导出可复现”面板一键完成：
-1. 导出 JSON（原始采样 + 全量事件含已取代行 + 参数 + 阶段指标）；
-2. 调 `/api/recompute` 从原始数据独立重算，逐指标比对（脱水/梅纳/发展/一爆/总时长/DTR）；
+1. 导出 JSON（原始采样 + 全量事件含已取代行 + **全量中断账本（含所有历史版本与
+   各版本当时的阶段指标）** + 参数 + 墙钟/活动双口径阶段指标）；
+2. 调 `/api/recompute` 从原始数据独立重算，逐指标比对（脱水/梅纳/发展/一爆/总时长/DTR
+   的墙钟与活动值、中断边界带状、冲突 code、可计算性标志）；
 3. 再用翻倍窗口、不同平滑重取曲线，逐点比对原始豆温/环温**完全不变**。
+
+中断验收对应：
+1. 合法 start→resume 后，阶段表同时给出墙钟与活动时长，曲线出现停热带，原始曲线完整可查；
+2. 重复恢复 409 且活动时长不累计两次；无未关闭中断的恢复被拒绝；
+3. 后补修正以新版本取代旧版本，旧区间与当时指标在版本历史/导出中保留，当前指标按新版本重算；
+4. 两个重叠区间或锚点落在中断内被明确标为冲突（红带+code+message），不输出伪造的活动 DTR；
+5. 刷新、导出与 `/api/recompute` 独立重算后，中断边界、所用口径与结果完全一致。
 
 ## API 摘要
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/batches` | 批次列表 |
+| GET | `/api/batches` | 批次列表（含 `status`） |
 | POST | `/api/seed` | 生成两个合成批次 |
-| GET | `/api/batches/{id}/series?window_s&display_smooth_s&max_gap_fill_s` | 曲线+RoR+指标 |
+| GET | `/api/batches/{id}/series?window_s&display_smooth_s&max_gap_fill_s` | 曲线+RoR+中断带+墙钟/活动双口径指标 |
 | GET/POST | `/api/batches/{id}/events[?include_history=true]` | 事件列表/人工修正（只追加） |
+| GET | `/api/batches/{id}/interruptions[?include_history=true]` | 当前中断解释 + 账本记录（含版本历史） |
+| POST | `/api/batches/{id}/interruptions` | 登记 start / resume / terminate（状态机强制） |
+| POST | `/api/batches/{id}/interruptions/correct?interval_id=` | 后补修正：写入新版本，旧版本保留 |
 | GET | `/api/compare?a=&b=` | 双批次叠加（含非因果声明） |
-| GET | `/api/batches/{id}/export` | 自包含导出 |
-| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标 |
+| GET | `/api/batches/{id}/export` | 自包含导出（全量账本+各版本历史指标，export_version=2） |
+| POST | `/api/recompute` | 从导出载荷独立重算全部派生指标（含中断口径） |
 
 ## 目录
 

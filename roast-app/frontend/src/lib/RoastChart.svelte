@@ -7,11 +7,14 @@
   //  - interpolated segments use a different symbol/colour and a legend entry;
   //  - RoR is drawn on its own axis and the window basis is shown in the title;
   //  - events are markLines; damper changes get a distinct dashed gold line;
+  //  - heat-off interruption bands are a separate operator-sourced layer
+  //    (hatched blue = closed heat-off, hatched amber = still open, red =
+  //    conflict).  Probe dropouts are NOT rendered as interruptions;
   //  - nothing on the chart claims the damper change caused the shape.
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
   import * as echarts from 'echarts';
 
-  export let payloads = []; // [{batch, series, events, metrics}]
+  export let payloads = []; // [{batch, series, events, metrics, interruptions}]
   export let windowS = 30;
   export let smoothS = 12;
 
@@ -58,6 +61,54 @@
     }
     if (cur.length) runs.push({ interp: curInterp, data: cur });
     return runs.filter((r) => r.interp === isInterpRun);
+  }
+
+  // Heat-off interruption bands — operator ledger only.  A probe dropout is
+  // never turned into a band.  Conflicting bands are red, open bands amber.
+  function interruptionAreas(pl) {
+    const bands = pl.series?.interruption_bands || [];
+    const conflicts = pl.interruptions?.current?.conflicts || [];
+    const badIds = new Set();
+    for (const c of conflicts) {
+      if (c.interval_id) badIds.add(c.interval_id);
+      if (c.other_interval_id) badIds.add(c.other_interval_id);
+    }
+    return bands
+      .filter((b) => b.end_s !== null && b.end_s !== undefined)
+      .map((b) => {
+        const conflicted = badIds.has(b.interval_id);
+        const color = conflicted ? '#e35d5d' : b.open ? '#d49a37' : '#4a7fd4';
+        return [
+          {
+            xAxis: b.start_s,
+            itemStyle: {
+              color,
+              opacity: conflicted ? 0.22 : 0.16,
+              borderColor: color,
+              borderWidth: 1,
+              borderType: b.open ? 'dotted' : 'dashed',
+            },
+            label: {
+              show: true,
+              position: 'insideTop',
+              color: '#efe7dd',
+              fontSize: 10,
+              formatter: conflicted
+                ? '⚠ 冲突'
+                : b.open
+                  ? `中断中 ${fmtMMSS(b.start_s)} → ?`
+                  : `停热 ${fmtMMSS(b.start_s)}–${fmtMMSS(b.end_s)}`,
+            },
+          },
+          { xAxis: b.end_s },
+        ];
+      });
+  }
+
+  function fmtMMSS(s) {
+    const m = Math.floor(s / 60);
+    const sec = Math.round(s % 60);
+    return `${m}:${String(sec).padStart(2, '0')}`;
   }
 
   function buildOption() {
@@ -175,6 +226,10 @@
         silent: false,
         symbol: 'none',
         data: markLines,
+      };
+      target.markArea = {
+        silent: true,
+        data: interruptionAreas(pl),
       };
     });
 
